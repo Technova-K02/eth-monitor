@@ -1,116 +1,61 @@
 import { ethers } from 'ethers';
 import { WebhookClient, EmbedBuilder } from 'discord.js';
 import dotenv from 'dotenv';
+import axios from 'axios';
 
 dotenv.config();
 
 class BNBWalletMonitor {
   constructor() {
-    // Use WebSocketProvider for real-time events
-    const wsUrl = (process.env.BNB_RPC_URL || 'https://bsc-dataseed.binance.org/')
-      .replace('https://', 'wss://')
-      .replace('http://', 'ws://');
-    
-    this.provider = new ethers.WebSocketProvider(wsUrl);
+    // Use JsonRpcProvider for HTTP requests (WebSocket not supported by public RPCs)
+    this.provider = new ethers.JsonRpcProvider(process.env.BNB_RPC_URL || 'https://bsc-dataseed.binance.org/');
     this.walletAddress = process.env.BNB_WALLET_ADDRESS.toLowerCase();
     this.webhookClient = new WebhookClient({ 
       url: process.env.DISCORD_WEBHOOK_URL_BNB || process.env.DISCORD_WEBHOOK_URL 
     });
     this.processedTxs = new Set();
-    this.pendingTxs = new Map();
+    this.lastCheckedBlock = 0;
+    this.isRunning = false;
+    this.checkInterval = 3000; // Check every 3 seconds (BSC blocks are ~3 seconds)
   }
 
   async start() {
-    console.log(`Starting real-time BNB wallet monitor for: ${this.walletAddress}`);
-    console.log('Using WebSocket for instant notifications...');
+    console.log(`Starting BNB wallet monitor for: ${this.walletAddress}`);
+    console.log('Using polling for transaction monitoring (3-second intervals)...');
     
-    // Listen for pending transactions in real-time
-    this.provider.on('pending', async (txHash) => {
-      await this.handlePendingTx(txHash);
-    });
-
-    // Listen for new blocks to catch confirmed transactions in real-time
-    this.provider.on('block', async (blockNumber) => {
-      await this.handleNewBlock(blockNumber);
-    });
-    
-    console.log('✓ BNB monitor is running in real-time mode!');
-  }
-
-  async handlePendingTx(txHash) {
+    // Get current block number
     try {
-      // Check if already processed or being tracked
-      if (this.processedTxs.has(txHash) || this.pendingTxs.has(txHash)) return;
-
-      const tx = await this.provider.getTransaction(txHash);
-      if (!tx) return;
-
-      const isIncoming = tx.to?.toLowerCase() === this.walletAddress;
-      const isOutgoing = tx.from?.toLowerCase() === this.walletAddress;
-
-      if (isIncoming || isOutgoing) {
-        // Mark as processed immediately to prevent duplicates
-        this.pendingTxs.set(txHash, { tx, isIncoming, timestamp: Date.now(), notified: false });
-        
-        // Only send notification if not already notified
-        const txData = this.pendingTxs.get(txHash);
-        if (!txData.notified) {
-          await this.sendDiscordNotification(tx, 'pending', isIncoming);
-          txData.notified = true;
-          console.log(`⏳ Pending ${isIncoming ? 'incoming' : 'outgoing'} tx: ${txHash}`);
-        }
-      }
+      this.lastCheckedBlock = await this.provider.getBlockNumber();
+      console.log(`Starting from block: ${this.lastCheckedBlock}`);
     } catch (error) {
-      // Silently handle errors for pending txs (they may not be available yet)
-      if (error.message?.includes('429')) {
-        console.log('⚠ Rate limit hit, slowing down...');
-      }
+      console.error('Error getting current block:', error.message);
+      return;
     }
+
+    this.isRunning = true;
+    this.startPolling();
+    
+    console.log('✓ BNB monitor is running!');
   }
 
-  async handleNewBlock(blockNumber) {
+  startPolling() {
+    this.pollBlocks();
+  }
+
+  async pollBlocks() {
+    if (!this.isRunning) return;
+
+    const startTime = Date.now();
+
     try {
-      // Only check pending txs we're tracking - don't scan entire block
-      if (this.pendingTxs.size > 0) {
-        const txsToCheck = Array.from(this.pendingTxs.entries());
-        
-        for (const [txHash, data] of txsToCheck) {
-          // Skip if already marked as processed
-          if (this.processedTxs.has(txHash)) {
-            this.pendingTxs.delete(txHash);
-            continue;
-          }
-
-          try {
-            const receipt = await this.provider.getTransactionReceipt(txHash);
-            if (receipt && receipt.blockNumber) {
-              // Transaction is confirmed
-              const { isIncoming } = data;
-              
-              // Mark as processed BEFORE sending notification
-              this.processedTxs.add(txHash);
-              this.pendingTxs.delete(txHash);
-              
-              const tx = await this.provider.getTransaction(txHash);
-              if (tx) {
-                await this.sendDiscordNotification(tx, 'confirmed', isIncoming);
-                console.log(`✓ Confirmed ${isIncoming ? 'incoming' : 'outgoing'} tx: ${txHash}`);
-              }
-            }
-          } catch (error) {
-            // Transaction not yet mined, continue
-          }
+      const currentBlock = await this.provider.getBlockNumber();
+      
+      // Check new blocks since last check
+      if (currentBlock > this.lastCheckedBlock) {
+        for (let blockNum = this.lastCheckedBlock + 1; blockNum <= currentBlock; blockNum++) {
+          await this.checkBlockTransactions(blockNum);
         }
-      }
-
-      // Clean up old pending txs (older than 10 minutes)
-      const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
-      for (const [hash, data] of this.pendingTxs.entries()) {
-        if (data.timestamp < tenMinutesAgo) {
-          this.pendingTxs.delete(hash);
-          this.processedTxs.add(hash); // Mark as processed to prevent future duplicates
-          console.log(`⚠ Dropped pending tx (timeout): ${hash}`);
-        }
+        this.lastCheckedBlock = currentBlock;
       }
 
       // Clean up old processed txs (keep last 2000)
@@ -118,10 +63,45 @@ class BNBWalletMonitor {
         const txArray = Array.from(this.processedTxs);
         this.processedTxs = new Set(txArray.slice(-2000));
       }
+
     } catch (error) {
-      if (!error.message?.includes('429')) {
-        console.error('Error handling new block:', error.message);
+      console.error('Error polling blocks:', error.message);
+    }
+
+    // Calculate next poll time to maintain consistent interval
+    const elapsed = Date.now() - startTime;
+    const nextPoll = Math.max(0, this.checkInterval - elapsed);
+
+    setTimeout(() => this.pollBlocks(), nextPoll);
+  }
+
+  async checkBlockTransactions(blockNumber) {
+    try {
+      const block = await this.provider.getBlock(blockNumber, true);
+      if (!block || !block.transactions) return;
+
+      for (const tx of block.transactions) {
+        const txHash = typeof tx === 'string' ? tx : tx.hash;
+        
+        if (this.processedTxs.has(txHash)) continue;
+
+        const transaction = typeof tx === 'string' 
+          ? await this.provider.getTransaction(tx)
+          : tx;
+
+        if (!transaction) continue;
+
+        const isIncoming = transaction.to?.toLowerCase() === this.walletAddress;
+        const isOutgoing = transaction.from?.toLowerCase() === this.walletAddress;
+
+        if (isIncoming || isOutgoing) {
+          this.processedTxs.add(txHash);
+          await this.sendDiscordNotification(transaction, 'confirmed', isIncoming);
+          console.log(`✓ Confirmed ${isIncoming ? 'incoming' : 'outgoing'} tx: ${txHash}`);
+        }
       }
+    } catch (error) {
+      console.error(`Error checking block ${blockNumber}:`, error.message);
     }
   }
 

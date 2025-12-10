@@ -4,15 +4,24 @@
   "description": "Monitor Ethereum wallet transactions and send to Discord",
   "main": "index.js",
   "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
+
   "keywords": ["ethereum", "wallet", "monitor", "discord"],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "ethers": "^6.9.0",
     "discord.js": "^14.14.1",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "@solana/web3.js": "^1.87.6",
+    "tronweb": "^5.3.2",
+    "axios": "^1.6.2"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "sol": "node sol.js",
+    "tron": "node tron.js",
+    "bnb": "node bnb.js",
+    "btc": "node btc.js",
+    "ltc": "node ltc.js"
   }
 }

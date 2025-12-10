@@ -17,11 +17,12 @@
     "axios": "^1.6.2"
   },
   "scripts": {
-    "start": "node index.js",
+    "start": "node eth.js",
     "sol": "node sol.js",
     "tron": "node tron.js",
     "bnb": "node bnb.js",
     "btc": "node btc.js",
-    "ltc": "node ltc.js"
+    "ltc": "node ltc.js",
+    "all": "node all.js"
   }
 }

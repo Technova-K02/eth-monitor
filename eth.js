@@ -1,170 +1,210 @@
-import { ethers } from 'ethers';
-import { WebhookClient, EmbedBuilder } from 'discord.js';
-import dotenv from 'dotenv';
-
+// =========================
+// CONFIG
+// =========================
+import dotenv from "dotenv";
+import { WebSocket } from "ws";
+import axios from "axios";
 dotenv.config();
 
-class WalletMonitor {
-  constructor() {
-    // Use WebSocketProvider for real-time events
-    const wsUrl = process.env.ETH_RPC_URL.replace('https://', 'wss://').replace('http://', 'ws://');
-    this.provider = new ethers.WebSocketProvider(wsUrl);
-    this.walletAddress = process.env.WALLET_ADDRESS.toLowerCase();
-    this.webhookClient = new WebhookClient({ url: process.env.DISCORD_WEBHOOK_URL_ETH });
-    this.processedTxs = new Set();
-    this.pendingTxs = new Map(); // Track pending txs to update when confirmed
-  }
+const ALCHEMY_WS = process.env.ALCHEMY_WS_URL;
+const ALCHEMY_HTTP = process.env.ETH_RPC_URL;
+const BLOCKPI_WS = process.env.BLOCKPI_WS_URL;
 
-  async start() {
-    console.log(`Starting real-time wallet monitor for: ${this.walletAddress}`);
-    console.log('Using WebSocket for instant notifications...');
-    
-    // Listen for pending transactions in real-time
-    this.provider.on('pending', async (txHash) => {
-      await this.handlePendingTx(txHash);
-    });
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL_ETH;
 
-    // Listen for new blocks to catch confirmed transactions in real-time
-    this.provider.on('block', async (blockNumber) => {
-      await this.handleNewBlock(blockNumber);
-    });
-    
-    console.log('✓ Monitor is running in real-time mode!');
-  }
+// Wallets to monitor (lowercase)
+const WATCH_ADDRESSES = process.env.WALLET_ADDRESS
+    .split(",")
+    .map(a => a.trim().toLowerCase());
 
-  async handlePendingTx(txHash) {
+console.log(WATCH_ADDRESSES);
+
+// =========================
+// GLOBAL STATE
+// =========================
+
+let currentWS = null;
+let providerName = ""; // "alchemy" or "blockpi"
+let lastProcessedBlock = 0;
+
+// =========================
+// DISCORD NOTIFIER
+// =========================
+async function sendDiscordNotification(tx, isIncoming) {
     try {
-      if (this.processedTxs.has(txHash) || this.pendingTxs.has(txHash)) return;
-
-      const tx = await this.provider.getTransaction(txHash);
-      if (!tx) return;
-
-      const isIncoming = tx.to?.toLowerCase() === this.walletAddress;
-      const isOutgoing = tx.from?.toLowerCase() === this.walletAddress;
-
-      if (isIncoming || isOutgoing) {
-        this.pendingTxs.set(txHash, { tx, isIncoming, timestamp: Date.now() });
-        await this.sendDiscordNotification(tx, 'pending', isIncoming);
-        console.log(`⏳ Pending ${isIncoming ? 'incoming' : 'outgoing'} tx: ${txHash}`);
-      }
-    } catch (error) {
-      // Silently handle errors for pending txs (they may not be available yet)
-      if (error.message.includes('429')) {
-        console.log('⚠ Rate limit hit, slowing down...');
-      }
-    }
-  }
-
-  async handleNewBlock(blockNumber) {
-    try {
-      // Only check pending txs we're tracking - don't scan entire block
-      if (this.pendingTxs.size > 0) {
-        for (const [txHash, data] of this.pendingTxs.entries()) {
-          try {
-            const receipt = await this.provider.getTransactionReceipt(txHash);
-            if (receipt && receipt.blockNumber) {
-              // Transaction is confirmed
-              const { isIncoming } = data;
-              this.pendingTxs.delete(txHash);
-              this.processedTxs.add(txHash);
-              
-              const tx = await this.provider.getTransaction(txHash);
-              if (tx) {
-                await this.sendDiscordNotification(tx, 'confirmed', isIncoming);
-                console.log(`✓ Confirmed ${isIncoming ? 'incoming' : 'outgoing'} tx: ${txHash}`);
-              }
-            }
-          } catch (error) {
-            // Transaction not yet mined, continue
-          }
-        }
-      }
-
-      // Clean up old pending txs (older than 10 minutes)
-      const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
-      for (const [hash, data] of this.pendingTxs.entries()) {
-        if (data.timestamp < tenMinutesAgo) {
-          this.pendingTxs.delete(hash);
-          console.log(`⚠ Dropped pending tx (timeout): ${hash}`);
-        }
-      }
-    } catch (error) {
-      if (!error.message.includes('429')) {
-        console.error('Error handling new block:', error.message);
-      }
-    }
-  }
-
-  async sendDiscordNotification(tx, status, isIncoming) {
-    try {
-      const value = ethers.formatEther(tx.value || '0');
-      const valueNum = parseFloat(value);
-      
-      // Get real-time ETH price
-      const ethPriceUSD = await import('./priceService.js').then(m => m.default.getETHPrice());
-      const usdValue = (valueNum * ethPriceUSD).toFixed(2);
-      
-      const typeEmoji = isIncoming ? '📥' : '📤';
-      const typeText = isIncoming ? 'Incoming' : 'Outgoing';
-      const color = status === 'pending' ? 0x3498db : (isIncoming ? 0x2ecc71 : 0xe74c3c);
-      
-      const now = new Date();
-      const timeStr = now.toLocaleString('en-IN', { 
-        timeZone: 'Asia/Kolkata',
-        day: '2-digit',
-        month: 'short', 
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: true
-      }) + ' (IST)';
-
-      let description = '';
-      
-      if (status === 'pending') {
-        // Pending transaction format
-        description = `⚠️ **ETH Transaction Alert**\n\n`;
-        description += `${typeEmoji} **Type:** ${typeText}\n`;
-        description += `🪙 **Asset:** Ethereum (ETH)\n`;
-        description += `🔢 **Amount:** ${value} ETH\n`;
-        description += `💵 **USD Value:** $${usdValue}\n`;
-        description += `🕐 **Time:** ${timeStr}\n`;
-        description += `⏳ **Status:** Pending\n\n`;
-        description += `👉 **Action:** Wait for confirmations\n\n`;
-        description += `🔗 **Transaction:** [View on Etherscan](https://sepolia.etherscan.io/tx/${tx.hash})`;
-      } else {
-        // Confirmed transaction format
-        const title = isIncoming 
-          ? `✅ **New ETH transaction of $${usdValue} received:**`
-          : `📤 **ETH transaction of $${usdValue} sent:**`;
+        const { ethers } = await import('ethers');
+        const { WebhookClient, EmbedBuilder } = await import('discord.js');
         
-        description = `${title}\n\n`;
-        description += `💰 **${value} ETH** ($${usdValue})\n`;
-        description += `⚡ **Status:** Confirmed\n`;
-        description += `🕐 **Time:** ${timeStr}\n`;
-        description += `🔗 **Network:** Ethereum (ETH)\n`;
-        description += `${typeEmoji} **Type:** ${typeText}\n\n`;
-        description += `📦 **Block:** ${tx.blockNumber}\n`;
-        description += `🔗 **Transaction:** [View on Etherscan](https://sepolia.etherscan.io/tx/${tx.hash})`;
-      }
+        const webhookClient = new WebhookClient({ url: DISCORD_WEBHOOK });
+        
+        const value = ethers.formatEther(tx.value || '0');
+        const valueNum = parseFloat(value);
 
-      const embed = new EmbedBuilder()
-        .setDescription(description)
-        .setColor(color)
-        .setTimestamp();
+        // Get real-time ETH price
+        const ethPriceUSD = await import('./priceService.js').then(m => m.default.getETHPrice());
+        const usdValue = (valueNum * ethPriceUSD).toFixed(2);
 
-      await this.webhookClient.send({
-        embeds: [embed]
-      });
+        const typeEmoji = isIncoming ? '📥' : '📤';
+        const typeText = isIncoming ? 'Incoming' : 'Outgoing';
+        const color = isIncoming ? 0x2ecc71 : 0xe74c3c;
 
-      console.log(`Sent ${status} ${typeText.toLowerCase()} transaction: ${tx.hash}`);
-    } catch (error) {
-      console.error('Error sending Discord notification:', error.message);
+        const now = new Date();
+        const timeStr = now.toLocaleString('en-IN', {
+            timeZone: 'Asia/Kolkata',
+            day: '2-digit',
+            month: 'short',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true
+        }) + ' (IST)';
+
+        // Confirmed transaction format
+        const title = isIncoming
+            ? `✅ **New ETH transaction of ${usdValue} received:**`
+            : `📤 **ETH transaction of ${usdValue} sent:**`;
+
+        const description = `${title}\n\n` +
+            `💰 **${value} ETH** (${usdValue})\n` +
+            `⚡ **Status:** Confirmed\n` +
+            `🕐 **Time:** ${timeStr}\n` +
+            `🔗 **Network:** Ethereum (ETH)\n` +
+            `${typeEmoji} **Type:** ${typeText}\n\n` +
+            `📦 **Block:** ${parseInt(tx.blockNumber, 16)}\n` +
+            `🔗 **Transaction:** [View on Etherscan](https://sepolia.etherscan.io/tx/${tx.hash})`;
+
+        const embed = new EmbedBuilder()
+            .setDescription(description)
+            .setColor(color)
+            .setTimestamp();
+
+        await webhookClient.send({
+            embeds: [embed]
+        });
+
+        console.log(`Sent confirmed ${typeText.toLowerCase()} transaction: ${tx.hash}`);
+    } catch (err) {
+        console.log("Discord send error:", err.message);
     }
-  }
 }
 
-// Start the monitor
-const monitor = new WalletMonitor();
-monitor.start().catch(console.error);
+// =========================
+// BLOCK FETCHING
+// =========================
+async function fetchBlock(blockNumber) {
+    const payload = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_getBlockByNumber",
+        params: [blockNumber, true] // include full txs
+    };
+
+    const res = await axios.post(ALCHEMY_HTTP, payload);
+    return res.data.result;
+}
+
+// =========================
+// MAIN BLOCK PROCESSOR
+// =========================
+async function processBlock(hexBlockNumber) {
+    const blockNumber = parseInt(hexBlockNumber, 16);
+
+    if (blockNumber <= lastProcessedBlock) return;
+    lastProcessedBlock = blockNumber;
+
+    console.log(`🔵 New Block: ${blockNumber} (provider: ${providerName})`);
+
+    let block;
+    try {
+        block = await fetchBlock(hexBlockNumber);
+        console.log(`Block: ${JSON.stringify(block)}`);
+    } catch (err) {
+        console.log("Fetch block failed:", err.message);
+        return;
+    }
+
+    if (!block || !block.transactions) return;
+
+    for (const tx of block.transactions) {
+        const from = tx.from?.toLowerCase();
+        const to = tx.to?.toLowerCase();
+
+        const isIncoming = WATCH_ADDRESSES.includes(to);
+        const isOutgoing = WATCH_ADDRESSES.includes(from);
+        const isInvolved = isIncoming || isOutgoing;
+
+        if (isInvolved) {
+            await sendDiscordNotification(tx, isIncoming);
+        }
+    }
+}
+
+// =========================
+// WEBSOCKET CONNECTION
+// =========================
+function connectWS(url, name) {
+    console.log(`🔌 Connecting WebSocket: ${name} ...`);
+    providerName = name;
+    currentWS = new WebSocket(url);
+
+    currentWS.on("open", () => {
+        console.log(`🟢 ${name} WS connected`);
+        subscribeNewHeads();
+    });
+
+    currentWS.on("message", data => {
+        try {
+            const json = JSON.parse(data);
+            if (json.method === "eth_subscription" && json.params?.result?.number) {
+                processBlock(json.params.result.number);
+            }
+        } catch (err) {
+            console.log("WS parse error:", err.message);
+        }
+    });
+
+    currentWS.on("close", () => {
+        console.log(`🔴 ${name} WS closed. Reconnecting...`);
+        failoverReconnect(name);
+    });
+
+    currentWS.on("error", () => {
+        console.log(`⚠️ ${name} WS error. Switching provider...`);
+        failoverReconnect(name);
+    });
+}
+
+// Subscribe to new block headers
+function subscribeNewHeads() {
+    const payload = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_subscribe",
+        params: ["newHeads"]
+    };
+    currentWS.send(JSON.stringify(payload));
+}
+
+// =========================
+// FAILOVER LOGIC
+// =========================
+function failoverReconnect(failedName) {
+    if (failedName === "alchemy") {
+        console.log("🔁 Switching to BlockPi WS...");
+        setTimeout(() => connectWS(BLOCKPI_WS, "blockpi"), 2000);
+    } else {
+        console.log("🔁 Switching back to Alchemy WS...");
+        setTimeout(() => connectWS(ALCHEMY_WS, "alchemy"), 2000);
+    }
+}
+
+// =========================
+// START BOT
+// =========================
+function start() {
+    console.log("🚀 Starting Ethereum Monitor...");
+    connectWS(ALCHEMY_WS, "blockpi");
+}
+
+start();

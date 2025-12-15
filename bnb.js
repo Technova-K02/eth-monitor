@@ -1,203 +1,279 @@
-import { ethers } from 'ethers';
-import { WebhookClient, EmbedBuilder } from 'discord.js';
-import dotenv from 'dotenv';
-import axios from 'axios';
+// =========================
+// BNB WALLET MONITOR - HYBRID APPROACH
+// =========================
+// Strategy:
+// - BlockPi WebSocket for real-time notifications (0 RU cost)
+// - Ankr HTTP for block/transaction fetching (500M credits/month)
+// - Optimized for BSC 3-second block times
+// =========================
 
+import dotenv from "dotenv";
+import { WebSocket } from "ws";
+import axios from "axios";
 dotenv.config();
 
-class BNBWalletMonitor {
-  constructor() {
-    // Use JsonRpcProvider for HTTP requests (WebSocket not supported by public RPCs)
-    this.provider = new ethers.JsonRpcProvider(process.env.BNB_RPC_URL || 'https://bsc-dataseed.binance.org/');
-    this.walletAddress = process.env.BNB_WALLET_ADDRESS.toLowerCase();
-    this.webhookClient = new WebhookClient({ 
-      url: process.env.DISCORD_WEBHOOK_URL_BNB || process.env.DISCORD_WEBHOOK_URL 
-    });
-    this.processedTxs = new Set();
-    this.lastCheckedBlock = 0;
-    this.isRunning = false;
-    this.checkInterval = 3000; // Check every 3 seconds (BSC blocks are ~3 seconds)
-  }
+// =========================
+// CONFIG
+// =========================
+const BLOCKPI_WS = process.env.BLOCKPI_WS_URL_BNB;
+const ANKR_HTTP = process.env.ANKR_HTTP_URL_BNB || 'https://rpc.ankr.com/bsc';
+const FALLBACK_WS = process.env.BSC_FALLOVER_WS;
 
-  async start() {
-    console.log(`Starting BNB wallet monitor for: ${this.walletAddress}`);
-    console.log('Using polling for transaction monitoring (3-second intervals)...');
-    
-    // Get current block number
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL_BNB;
+
+// Wallets to monitor (lowercase)
+const WATCH_ADDRESSES = process.env.BNB_WALLET_ADDRESS
+    .split(",")
+    .map(a => a.trim().toLowerCase());
+
+console.log("📍 Monitoring BNB addresses:", WATCH_ADDRESSES);
+
+// =========================
+// GLOBAL STATE
+// =========================
+let currentWS = null;
+let providerName = ""; // "blockpi" or "fallback"
+let lastProcessedBlock = 0;
+let processedTxs = new Set(); // Prevent duplicate notifications
+
+// =========================
+// DISCORD NOTIFIER
+// =========================
+async function sendDiscordNotification(tx, isIncoming) {
     try {
-      this.lastCheckedBlock = await this.provider.getBlockNumber();
-      console.log(`Starting from block: ${this.lastCheckedBlock}`);
-    } catch (error) {
-      console.error('Error getting current block:', error.message);
-      return;
-    }
-
-    this.isRunning = true;
-    this.startPolling();
-    
-    console.log('✓ BNB monitor is running!');
-  }
-
-  startPolling() {
-    this.pollBlocks();
-  }
-
-  async pollBlocks() {
-    if (!this.isRunning) return;
-
-    const startTime = Date.now();
-
-    try {
-      const currentBlock = await this.provider.getBlockNumber();
-      
-      // Check new blocks since last check
-      if (currentBlock > this.lastCheckedBlock) {
-        for (let blockNum = this.lastCheckedBlock + 1; blockNum <= currentBlock; blockNum++) {
-          await this.checkBlockTransactions(blockNum);
-        }
-        this.lastCheckedBlock = currentBlock;
-      }
-
-      // Clean up old processed txs (keep last 2000)
-      if (this.processedTxs.size > 2000) {
-        const txArray = Array.from(this.processedTxs);
-        this.processedTxs = new Set(txArray.slice(-2000));
-      }
-
-    } catch (error) {
-      console.error('Error polling blocks:', error.message);
-    }
-
-    // Calculate next poll time to maintain consistent interval
-    const elapsed = Date.now() - startTime;
-    const nextPoll = Math.max(0, this.checkInterval - elapsed);
-
-    setTimeout(() => this.pollBlocks(), nextPoll);
-  }
-
-  async checkBlockTransactions(blockNumber) {
-    try {
-      const block = await this.provider.getBlock(blockNumber, true);
-      if (!block || !block.transactions) return;
-
-      for (const tx of block.transactions) {
-        const txHash = typeof tx === 'string' ? tx : tx.hash;
+        const { ethers } = await import('ethers');
+        const { WebhookClient, EmbedBuilder } = await import('discord.js');
         
-        if (this.processedTxs.has(txHash)) continue;
+        const webhookClient = new WebhookClient({ url: DISCORD_WEBHOOK });
+        
+        const value = ethers.formatEther(tx.value || '0');
+        const valueNum = parseFloat(value);
 
-        const transaction = typeof tx === 'string' 
-          ? await this.provider.getTransaction(tx)
-          : tx;
+        // Get real-time BNB price
+        const bnbPriceUSD = await import('./priceService.js').then(m => m.default.getBNBPrice());
+        const usdValue = (valueNum * bnbPriceUSD).toFixed(2);
 
-        if (!transaction) continue;
+        const typeEmoji = isIncoming ? '📥' : '📤';
+        const typeText = isIncoming ? 'Incoming' : 'Outgoing';
+        const color = isIncoming ? 0x2ecc71 : 0xe74c3c;
 
-        const isIncoming = transaction.to?.toLowerCase() === this.walletAddress;
-        const isOutgoing = transaction.from?.toLowerCase() === this.walletAddress;
+        const now = new Date();
+        const timeStr = now.toLocaleString('en-IN', {
+            timeZone: 'Asia/Kolkata',
+            day: '2-digit',
+            month: 'short',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true
+        }) + ' (IST)';
 
-        if (isIncoming || isOutgoing) {
-          this.processedTxs.add(txHash);
-          await this.sendDiscordNotification(transaction, 'confirmed', isIncoming);
-          console.log(`✓ Confirmed ${isIncoming ? 'incoming' : 'outgoing'} tx: ${txHash}`);
-        }
-      }
-    } catch (error) {
-      console.error(`Error checking block ${blockNumber}:`, error.message);
-    }
-  }
+        const network = getNetwork();
+        const explorerUrl = network === 'Testnet'
+            ? `https://testnet.bscscan.com/tx/${tx.hash}`
+            : `https://bscscan.com/tx/${tx.hash}`;
 
-  async sendDiscordNotification(tx, status, isIncoming) {
-    try {
-      // Create unique key for this notification
-      const notificationKey = `${tx.hash}-${status}`;
-      
-      // Check if we already sent this exact notification
-      if (this.processedTxs.has(notificationKey)) {
-        console.log(`⚠ Skipping duplicate notification: ${notificationKey}`);
-        return;
-      }
-      
-      // Mark this notification as sent
-      this.processedTxs.add(notificationKey);
-
-      const value = ethers.formatEther(tx.value || '0');
-      const valueNum = parseFloat(value);
-      
-      // Get real-time BNB price
-      const bnbPriceUSD = await import('./priceService.js').then(m => m.default.getBNBPrice());
-      const usdValue = (valueNum * bnbPriceUSD).toFixed(2);
-      
-      const typeEmoji = isIncoming ? '📥' : '📤';
-      const typeText = isIncoming ? 'Incoming' : 'Outgoing';
-      const color = status === 'pending' ? 0x3498db : (isIncoming ? 0x2ecc71 : 0xe74c3c);
-      
-      const now = new Date();
-      const timeStr = now.toLocaleString('en-IN', { 
-        timeZone: 'Asia/Kolkata',
-        day: '2-digit',
-        month: 'short', 
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: true
-      }) + ' (IST)';
-
-      const network = this.getNetwork();
-      const explorerUrl = network === 'Testnet'
-        ? `https://testnet.bscscan.com/tx/${tx.hash}`
-        : `https://bscscan.com/tx/${tx.hash}`;
-
-      let description = '';
-      
-      if (status === 'pending') {
-        // Pending transaction format
-        description = `⚠️ **BNB Transaction Alert**\n\n`;
-        description += `${typeEmoji} **Type:** ${typeText}\n`;
-        description += `🪙 **Asset:** BNB (Binance Coin)\n`;
-        description += `🔢 **Amount:** ${value} BNB\n`;
-        description += `💵 **USD Value:** $${usdValue}\n`;
-        description += `🕐 **Time:** ${timeStr}\n`;
-        description += `⏳ **Status:** Pending\n\n`;
-        description += `👉 **Action:** Wait for confirmations\n\n`;
-        description += `🔗 **Transaction:** [View on BscScan](${explorerUrl})`;
-      } else {
         // Confirmed transaction format
-        const title = isIncoming 
-          ? `✅ **New BNB transaction of $${usdValue} received:**`
-          : `📤 **BNB transaction of $${usdValue} sent:**`;
-        
-        description = `${title}\n\n`;
-        description += `💰 **${value} BNB** ($${usdValue})\n`;
-        description += `⚡ **Status:** Confirmed\n`;
-        description += `🕐 **Time:** ${timeStr}\n`;
-        description += `🔗 **Network:** BSC (${network})\n`;
-        description += `${typeEmoji} **Type:** ${typeText}\n\n`;
-        description += `📦 **Block:** ${tx.blockNumber}\n`;
-        description += `🔗 **Transaction:** [View on BscScan](${explorerUrl})`;
-      }
+        const title = isIncoming
+            ? `✅ **New BNB transaction of ${usdValue} received:**`
+            : `📤 **BNB transaction of ${usdValue} sent:**`;
 
-      const embed = new EmbedBuilder()
-        .setDescription(description)
-        .setColor(color)
-        .setTimestamp();
+        const description = `${title}\n\n` +
+            `💰 **${value} BNB** (${usdValue})\n` +
+            `⚡ **Status:** Confirmed\n` +
+            `🕐 **Time:** ${timeStr}\n` +
+            `🔗 **Network:** BSC (${network})\n` +
+            `${typeEmoji} **Type:** ${typeText}\n\n` +
+            `📦 **Block:** ${tx.blockNumber}\n` +
+            `🔗 **Transaction:** [View on BscScan](${explorerUrl})`;
 
-      await this.webhookClient.send({
-        embeds: [embed]
-      });
+        const embed = new EmbedBuilder()
+            .setDescription(description)
+            .setColor(color)
+            .setTimestamp();
 
-      console.log(`Sent ${status} ${typeText.toLowerCase()} transaction: ${tx.hash}`);
-    } catch (error) {
-      console.error('Error sending Discord notification:', error.message);
+        await webhookClient.send({
+            embeds: [embed]
+        });
+
+        console.log(`✅ Sent confirmed ${typeText.toLowerCase()} transaction: ${tx.hash}`);
+    } catch (err) {
+        console.log("❌ Discord send error:", err.message);
     }
-  }
-
-  getNetwork() {
-    const url = process.env.BNB_RPC_URL || '';
-    if (url.includes('testnet')) return 'Testnet';
-    return 'Mainnet';
-  }
 }
 
-// Start the monitor
-const monitor = new BNBWalletMonitor();
-monitor.start().catch(console.error);
+function getNetwork() {
+    const url = ANKR_HTTP || '';
+    if (url.includes('testnet')) return 'Testnet';
+    return 'Mainnet';
+}
+
+// =========================
+// BLOCK FETCHING (ANKR)
+// =========================
+async function fetchBlock(blockNumber) {
+    const payload = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_getBlockByNumber",
+        params: [blockNumber, true] // include full txs
+    };
+
+    try {
+        const res = await axios.post(ANKR_HTTP, payload, {
+            timeout: 10000,
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        return res.data.result;
+    } catch (error) {
+        console.log(`❌ Ankr fetch error: ${error.message}`);
+        throw error;
+    }
+}
+
+// =========================
+// MAIN BLOCK PROCESSOR
+// =========================
+async function processBlock(hexBlockNumber) {
+    const blockNumber = parseInt(hexBlockNumber, 16);
+
+    if (blockNumber <= lastProcessedBlock) return;
+    lastProcessedBlock = blockNumber;
+
+    console.log(`🟡 New BSC Block: ${blockNumber} (WS: ${providerName}, HTTP: Ankr)`);
+
+    let block;
+    try {
+        block = await fetchBlock(hexBlockNumber);
+    } catch (err) {
+        console.log(`❌ Block fetch failed for ${blockNumber}:`, err.message);
+        return;
+    }
+
+    if (!block || !block.transactions) {
+        console.log(`⚪ Block ${blockNumber} has no transactions`);
+        return;
+    }
+
+    console.log(`🔍 Checking ${block.transactions.length} transactions in block ${blockNumber}`);
+
+    for (const tx of block.transactions) {
+        // Skip if already processed
+        if (processedTxs.has(tx.hash)) continue;
+
+        const from = tx.from?.toLowerCase();
+        const to = tx.to?.toLowerCase();
+
+        const isIncoming = WATCH_ADDRESSES.includes(to);
+        const isOutgoing = WATCH_ADDRESSES.includes(from);
+        const isInvolved = isIncoming || isOutgoing;
+
+        if (isInvolved) {
+            processedTxs.add(tx.hash);
+            console.log(`🎯 Found wallet transaction: ${tx.hash}`);
+            console.log(`   From: ${from} (outgoing: ${isOutgoing})`);
+            console.log(`   To: ${to} (incoming: ${isIncoming})`);
+            console.log(`   Value: ${tx.value} wei`);
+            
+            await sendDiscordNotification(tx, isIncoming);
+        }
+    }
+
+    // Clean up old processed txs (keep last 1000)
+    if (processedTxs.size > 1000) {
+        const txArray = Array.from(processedTxs);
+        processedTxs = new Set(txArray.slice(-1000));
+    }
+}
+
+// =========================
+// WEBSOCKET CONNECTION (BLOCKPI)
+// =========================
+function connectWS(url, name) {
+    console.log(`🔌 Connecting WebSocket: ${name}...`);
+    providerName = name;
+    currentWS = new WebSocket(url);
+
+    currentWS.on("open", () => {
+        console.log(`🟢 ${name} WS connected`);
+        subscribeNewHeads();
+    });
+
+    currentWS.on("message", data => {
+        try {
+            const json = JSON.parse(data);
+            if (json.method === "eth_subscription" && json.params?.result?.number) {
+                processBlock(json.params.result.number);
+            }
+        } catch (err) {
+            console.log("❌ WS parse error:", err.message);
+        }
+    });
+
+    currentWS.on("close", () => {
+        console.log(`🔴 ${name} WS closed. Reconnecting...`);
+        failoverReconnect(name);
+    });
+
+    currentWS.on("error", (error) => {
+        console.log(`⚠️ ${name} WS error: ${error.message}`);
+        failoverReconnect(name);
+    });
+}
+
+// Subscribe to new block headers
+function subscribeNewHeads() {
+    const payload = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_subscribe",
+        params: ["newHeads"]
+    };
+    currentWS.send(JSON.stringify(payload));
+    console.log("📡 Subscribed to newHeads");
+}
+
+// =========================
+// FAILOVER LOGIC
+// =========================
+function failoverReconnect(failedName) {
+    if (failedName === "blockpi") {
+        if (FALLBACK_WS) {
+            console.log("🔁 Switching to fallback WS...");
+            setTimeout(() => connectWS(FALLBACK_WS, "fallback"), 2000);
+        } else {
+            console.log("🔁 Reconnecting to BlockPi WS...");
+            setTimeout(() => connectWS(BLOCKPI_WS, "blockpi"), 5000);
+        }
+    } else {
+        console.log("🔁 Switching back to BlockPi WS...");
+        setTimeout(() => connectWS(BLOCKPI_WS, "blockpi"), 2000);
+    }
+}
+
+// =========================
+// START MONITOR
+// =========================
+function start() {
+    console.log("🚀 Starting BNB Hybrid Monitor...");
+    console.log("📡 WebSocket Provider: BlockPi (0 RU cost)");
+    console.log("🌐 HTTP Provider: Ankr (500M credits/month)");
+    console.log("⚡ BSC Block Time: ~3 seconds");
+    
+    if (!BLOCKPI_WS) {
+        console.error("❌ BLOCKPI_WS_URL_BNB not configured!");
+        return;
+    }
+    
+    if (!DISCORD_WEBHOOK) {
+        console.error("❌ DISCORD_WEBHOOK_URL_BNB not configured!");
+        return;
+    }
+    
+    connectWS(BLOCKPI_WS, "blockpi");
+}
+
+start();

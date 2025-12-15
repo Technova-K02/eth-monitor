@@ -24,6 +24,15 @@ class TronWalletMonitor {
     this.checkInterval = 2000; // Check every 2 seconds for real-time monitoring
     this.isRunning = false;
     this.lastBalance = null;
+    this.tokenCache = new Map(); // Cache for token metadata
+    
+    // Known TRC-20 tokens
+    this.knownTokens = {
+      'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t': { symbol: 'USDT', decimals: 6, name: 'Tether USD' },
+      'TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8': { symbol: 'USDC', decimals: 6, name: 'USD Coin' },
+      'TMwFHYXLJaRUPeW6421aqXL4ZEzPRFGkGT': { symbol: 'USDJ', decimals: 18, name: 'JUST Stablecoin' },
+      'TNUC9Qb1rRpS5CbWLmNMxXBjyFoydXjWFR': { symbol: 'WTRX', decimals: 6, name: 'Wrapped TRX' },
+    };
   }
 
   async start() {
@@ -153,43 +162,150 @@ class TronWalletMonitor {
 
   async processTransaction(tx) {
     try {
-      // Only process TRX transfers (type: TransferContract)
       const contract = tx.raw_data?.contract?.[0];
-      if (!contract || contract.type !== 'TransferContract') return;
+      if (!contract) return;
 
-      const value = contract.parameter?.value;
-      if (!value) return;
+      const status = tx.ret?.[0]?.contractRet === 'SUCCESS' ? 'confirmed' : 'failed';
 
-      const fromAddress = this.tronWeb.address.fromHex(value.owner_address);
-      const toAddress = this.tronWeb.address.fromHex(value.to_address);
-      const amount = value.amount / 1000000; // Convert from SUN to TRX
+      // Handle native TRX transfers
+      if (contract.type === 'TransferContract') {
+        const value = contract.parameter?.value;
+        if (!value) return;
 
-      const isIncoming = toAddress === this.walletAddress;
-      const isOutgoing = fromAddress === this.walletAddress;
+        const fromAddress = this.tronWeb.address.fromHex(value.owner_address);
+        const toAddress = this.tronWeb.address.fromHex(value.to_address);
+        const amount = value.amount / 1000000; // Convert from SUN to TRX
 
-      if (!isIncoming && !isOutgoing) return;
+        const isIncoming = toAddress === this.walletAddress;
+        const isOutgoing = fromAddress === this.walletAddress;
 
-      const otherParty = isIncoming ? fromAddress : toAddress;
+        if (!isIncoming && !isOutgoing) return;
 
-      await this.sendDiscordNotification(
-        tx.txID,
-        amount,
-        isIncoming,
-        otherParty,
-        tx.block_timestamp,
-        tx.ret?.[0]?.contractRet === 'SUCCESS' ? 'confirmed' : 'failed'
-      );
+        const otherParty = isIncoming ? fromAddress : toAddress;
+
+        await this.sendDiscordNotification(
+          tx.txID,
+          amount,
+          isIncoming,
+          otherParty,
+          tx.block_timestamp,
+          status,
+          'TRX'
+        );
+      }
+      // Handle TRC-20 token transfers
+      else if (contract.type === 'TriggerSmartContract') {
+        const value = contract.parameter?.value;
+        if (!value || !value.data) return;
+
+        // Check if this is a transfer function call (method signature: a9059cbb)
+        const methodSignature = value.data.slice(0, 8);
+        if (methodSignature !== 'a9059cbb') return; // Not a transfer function
+
+        try {
+          // Parse transfer parameters: transfer(address to, uint256 amount)
+          const toAddressHex = '41' + value.data.slice(32, 72); // Extract 'to' address
+          const amountHex = value.data.slice(72, 136); // Extract amount
+
+          const toAddress = this.tronWeb.address.fromHex(toAddressHex);
+          const fromAddress = this.tronWeb.address.fromHex(value.owner_address);
+          const contractAddress = this.tronWeb.address.fromHex(value.contract_address);
+
+          const isIncoming = toAddress === this.walletAddress;
+          const isOutgoing = fromAddress === this.walletAddress;
+
+          if (!isIncoming && !isOutgoing) return;
+
+          // Get token metadata to determine correct decimals
+          const tokenMetadata = await this.getTokenMetadata(contractAddress);
+          const amount = parseInt(amountHex, 16) / Math.pow(10, tokenMetadata.decimals);
+          const otherParty = isIncoming ? fromAddress : toAddress;
+
+          await this.sendDiscordNotification(
+            tx.txID,
+            amount,
+            isIncoming,
+            otherParty,
+            tx.block_timestamp,
+            status,
+            'TRC-20',
+            contractAddress,
+            tokenMetadata
+          );
+
+        } catch (parseError) {
+          console.log(`Could not parse TRC-20 transfer: ${parseError.message}`);
+        }
+      }
 
     } catch (error) {
       console.error('Error processing transaction:', error.message);
     }
   }
 
-  async sendDiscordNotification(txId, amount, isIncoming, otherParty, blockTime, status) {
+  async getTokenMetadata(contractAddress) {
+    // Check cache first
+    if (this.tokenCache.has(contractAddress)) {
+      return this.tokenCache.get(contractAddress);
+    }
+    
+    // Check known tokens
+    if (this.knownTokens[contractAddress]) {
+      this.tokenCache.set(contractAddress, this.knownTokens[contractAddress]);
+      return this.knownTokens[contractAddress];
+    }
+    
     try {
-      // Get real-time TRX price
-      const trxPriceUSD = await import('./priceService.js').then(m => m.default.getTRXPrice());
-      const usdValue = (amount * trxPriceUSD).toFixed(2);
+      // Try to get token info from TronGrid API
+      const network = this.getNetwork();
+      const baseUrl = process.env.TRON_RPC_URL || 'https://api.trongrid.io';
+      
+      const response = await axios.get(`${baseUrl}/v1/contracts/${contractAddress}`, {
+        headers: process.env.TRON_API_KEY ? {
+          'TRON-PRO-API-KEY': process.env.TRON_API_KEY
+        } : {}
+      });
+      
+      if (response.data && response.data.data && response.data.data[0]) {
+        const contractInfo = response.data.data[0];
+        const metadata = {
+          symbol: contractInfo.symbol || `Token (${contractAddress.slice(0, 7)}...)`,
+          decimals: contractInfo.decimals || 6, // Default to 6 for TRC-20
+          name: contractInfo.name || 'Unknown Token'
+        };
+        
+        this.tokenCache.set(contractAddress, metadata);
+        return metadata;
+      }
+    } catch (error) {
+      console.log(`❌ Error fetching token metadata for ${contractAddress}: ${error.message}`);
+    }
+    
+    // Fallback
+    const fallback = {
+      symbol: `Token (${contractAddress.slice(0, 7)}...)`,
+      decimals: 6, // Most TRC-20 tokens use 6 decimals
+      name: 'Unknown Token'
+    };
+    
+    this.tokenCache.set(contractAddress, fallback);
+    return fallback;
+  }
+
+  async sendDiscordNotification(txId, amount, isIncoming, otherParty, blockTime, status, assetType = 'TRX', contractAddress = null, tokenMetadata = null) {
+    try {
+      let usdValue, assetName, title;
+      
+      if (assetType === 'TRC-20') {
+        // TRC-20 token transfer
+        assetName = tokenMetadata ? tokenMetadata.symbol : `Token (${contractAddress.slice(0, 7)}...)`;
+        usdValue = 'N/A'; // Token price lookup would require additional API calls
+      } else {
+        // Native TRX transfer
+        const trxPriceUSD = await import('./priceService.js').then(m => m.default.getTRXPrice());
+        usdValue = (amount * trxPriceUSD).toFixed(2);
+        assetName = 'TRX';
+      }
       
       const typeEmoji = isIncoming ? '📥' : '📤';
       const typeText = isIncoming ? 'Incoming' : 'Outgoing';
